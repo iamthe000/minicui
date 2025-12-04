@@ -3,275 +3,293 @@
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <termios.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
-#define MAX_LINE_LEN 256
-#define MAX_VARS 26
-#define MAX_STACK 100 
-#define MAX_VAR_LEN 64 // 変数に格納できる文字列の最大長
+#define MAX_LINE_LEN 1024
+#define MAX_LIST_ITEMS 100
+#define MAX_PATH_LEN 256
+#define MAX_ARGS 20 
 
-// すべての変数は文字列として保存
-char str_variables[MAX_VARS][MAX_VAR_LEN];
+// --- MiniCUI Runtime Structures ---
+typedef struct {
+    char items[MAX_LIST_ITEMS][MAX_PATH_LEN];
+    int is_dir[MAX_LIST_ITEMS];
+    int count;
+    int cursor;
+} CUI_List;
 
-// コールスタック (関数呼び出し用)
-long call_stack[MAX_STACK];
-int stack_ptr = 0;
+// グローバルなリストと変数
+CUI_List LIST_L1 = {0}, LIST_L2 = {0};
 
-void clear_screen() { printf("\033[2J"); }
-void set_cursor(int x, int y) { printf("\033[%d;%dH", y, x); }
-void set_color(int color_code) { printf("\033[%dm", color_code); }
-void reset_color() { printf("\033[0m"); }
+FILE *out;
 
-void error(const char *msg) {
-    fprintf(stderr, "\033[31mError: %s\033[0m\n", msg);
-    exit(1);
+// ===================================================
+// ランタイム機能
+// ===================================================
+
+void mc_cls() { printf("\033[2J"); }
+void mc_pos(int x, int y) { printf("\033[%d;%dH", y, x); }
+void mc_color(int c) { printf("\033[%dm", c); }
+void mc_reset() { printf("\033[0m"); }
+void mc_sleep(int ms) { usleep(ms * 1000); }
+
+void mc_box(int x, int y, int w, int h) {
+    mc_pos(x, y); printf("+"); for(int i=0;i<w-2;i++) printf("-"); printf("+");
+    for(int i=1; i<h-1; i++) { mc_pos(x, y+i); printf("|"); mc_pos(x+w-1, y+i); printf("|"); }
+    mc_pos(x, y+h-1); printf("+"); for(int i=0;i<w-2;i++) printf("-"); printf("+");
 }
 
-int get_var_index(char *token) {
-    if (!token || strlen(token) != 1 || !isupper(token[0])) {
-        return -1;
-    }
-    return token[0] - 'A';
+void mc_center(int y, char* str) {
+    int len = strlen(str);
+    int x = (80 - len) / 2;
+    if(x<1) x=1;
+    mc_pos(x, y); printf("%s", str);
 }
 
-// 数値を取得 (CALC, IF用)
-long get_num_value(char *token) {
-    int idx = get_var_index(token);
-    if (idx >= 0) {
-        // 変数の内容を数値に変換
-        return atol(str_variables[idx]);
-    }
-    // 数値リテラルとして変換
-    return atol(token);
+int mc_get_key() {
+    struct termios orig_termios, raw;
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    raw = orig_termios; raw.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    int c = getchar();
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+    return c;
 }
 
-// 引用符を考慮した引数解析
-char **parse_args(char *line, int *argc) {
-    static char *argv_storage[30]; 
-    char *p = line;
-    *argc = 0;
-
-    while (*p != '\0' && *argc < 30) {
-        while (isspace((unsigned char)*p)) p++;
-        if (*p == '\0') break;
-
-        argv_storage[*argc] = p;
-
-        if (*p == '"') {
-            p++; 
-            while (*p != '\0' && *p != '"') p++;
-            if (*p == '"') {
-                *p = '\0';
-                p++;
-            }
-        } else {
-            while (*p != '\0' && !isspace((unsigned char)*p)) p++;
+void mc_load_dir(CUI_List *list) {
+    DIR *d = opendir(".");
+    struct dirent *dir;
+    struct stat st;
+    list->count = 0; list->cursor = 0;
+    if (d) {
+        while ((dir = readdir(d)) != NULL) {
+            if (list->count >= MAX_LIST_ITEMS) break;
+            strcpy(list->items[list->count], dir->d_name);
+            stat(dir->d_name, &st);
+            list->is_dir[list->count] = S_ISDIR(st.st_mode);
+            list->count++;
         }
-        
-        if (*p != '\0') {
-            *p = '\0';
-            p++;
-        }
-        (*argc)++;
+        closedir(d);
     }
-    return argv_storage;
 }
 
-// ジャンプ関数 (省略)
-void jump_to_label(FILE *fp, const char *target_label) {
-    rewind(fp);
-    char line[MAX_LINE_LEN];
-    char label_def[MAX_LINE_LEN];
-    sprintf(label_def, "%s:", target_label);
-
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        line[strcspn(line, "\n")] = 0;
-        if (strcmp(line, label_def) == 0) {
-            return;
-        }
-    }
-    error("Label not found.");
-}
-
-
-void run_script(const char *filename) {
-    FILE *fp = fopen(filename, "r");
-    if (!fp) error("Could not open file.");
-
-    char line[MAX_LINE_LEN];
+void mc_render_list(CUI_List *list, int x, int y, int h) {
+    mc_reset();
+    int start_index = list->cursor - h / 2;
+    if (start_index < 0) start_index = 0;
+    if (start_index > list->count - h) start_index = list->count - h;
+    if (start_index < 0) start_index = 0; 
     
-    // 初期化 (すべての変数)
-    for (int i = 0; i < MAX_VARS; i++) {
-        str_variables[i][0] = '\0';
+    for(int i = 0; i < h; i++) {
+        int list_index = start_index + i;
+        mc_pos(x, y + i);
+        
+        if (list_index >= 0 && list_index < list->count) {
+            if (list_index == list->cursor) { mc_color(47); mc_color(30); printf(">"); } else { mc_color(40); printf(" "); }
+            if (list->is_dir[list_index]) mc_color(34); else mc_color(37);
+            
+            char temp_item[40];
+            strncpy(temp_item, list->items[list_index], 39);
+            temp_item[39] = '\0';
+            printf("%s", temp_item);
+            if (list->is_dir[list_index]) printf("/");
+            
+            for(int j=0; j<40-(int)strlen(temp_item)-(list->is_dir[list_index]?1:0); j++) printf(" ");
+        } else {
+            printf("                                             ");
+        }
+        mc_reset();
+    }
+}
+
+
+// ===================================================
+// コンパイラのコード生成部分
+// ===================================================
+
+void write_header() {
+    fprintf(out, "#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\n#include <string.h>\n#include <ctype.h>\n#include <dirent.h>\n#include <termios.h>\n#include <sys/stat.h>\n\n");
+    fprintf(out, "typedef struct { char items[%d][%d]; int is_dir[%d]; int count; int cursor; } CUI_List;\n", MAX_LIST_ITEMS, MAX_PATH_LEN, MAX_LIST_ITEMS);
+    
+    fprintf(out, "CUI_List LIST_L1 = {0}, LIST_L2 = {0};\n");
+    fprintf(out, "\n// --- MiniCUI Variables ---\n");
+    for (char c = 'A'; c <= 'Z'; c++) fprintf(out, "long VAR_%c = 0; ", c);
+    fprintf(out, "\n\n");
+
+    fprintf(out, "void mc_cls();\nvoid mc_pos(int x, int y);\nvoid mc_color(int c);\nvoid mc_reset();\nvoid mc_sleep(int ms);\nvoid mc_box(int x, int y, int w, int h);\nvoid mc_center(int y, char* str);\nint mc_get_key();\nvoid mc_load_dir(CUI_List *list);\nvoid mc_render_list(CUI_List *list, int x, int y, int h);\n");
+
+    fprintf(out, "int main() {\n");
+    fprintf(out, "    mc_cls();\n");
+}
+
+void write_footer() {
+    fprintf(out, "    mc_pos(1, 25); mc_reset();\n");
+    fprintf(out, "    return 0;\n");
+    fprintf(out, "}\n");
+}
+
+// -------------------------------------------------------------------
+// パース処理
+// -------------------------------------------------------------------
+void parse_line(char *line) {
+    char clean_line[MAX_LINE_LEN] = {0};
+    strcpy(clean_line, line);
+    clean_line[strcspn(clean_line, "\n")] = 0;
+    
+    char *comment = strchr(clean_line, '#');
+    if (comment) *comment = '\0';
+    if (strlen(clean_line) == 0) return;
+
+    char line_copy[MAX_LINE_LEN];
+    strcpy(line_copy, clean_line);
+
+    char *token = strtok(line_copy, " \t");
+    if (!token) return;
+
+    // ラベル処理
+    if (token[strlen(token)-1] == ':') {
+        token[strlen(token)-1] = '\0';
+        fprintf(out, "%s:\n", token);
+        return;
     }
 
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        char *comment = strchr(line, '#');
-        if (comment) *comment = '\0';
-        line[strcspn(line, "\n")] = 0;
+    const char *cmd = token;
+    
+    char *args[MAX_ARGS] = { NULL };
+    int arg_count = 0;
+    
+    while (arg_count < MAX_ARGS && (token = strtok(NULL, " \t")) != NULL) {
+        args[arg_count] = token;
+        arg_count++;
+    }
+
+    // --- コマンド解析 ---
+    
+    if (strcmp(cmd, "PRINT") == 0) {
+        if (arg_count == 1) {
+            if (args[0][0] == '"' || !isupper(args[0][0])) {
+                char *start_quote = strchr(clean_line, '"');
+                if (start_quote) fprintf(out, "    printf(\"%%s\\n\", %s);\n", start_quote);
+            } else { 
+                fprintf(out, "    printf(\"%%ld\\n\", VAR_%s);\n", args[0]); 
+            }
+        }
+    } 
+    else if (strcmp(cmd, "SLEEP") == 0) {
+        if (arg_count == 1) fprintf(out, "    mc_sleep(%s);\n", args[0]);
+    }
+    else if (strcmp(cmd, "CENTER") == 0) {
+        if (arg_count == 3) { 
+            char *start_quote = strchr(clean_line, '"');
+            if (start_quote) {
+                 fprintf(out, "    mc_color(%s); mc_center(%s, %s);\n", args[1], args[0], start_quote);
+            }
+        }
+    }
+    else if (strcmp(cmd, "SPLASH") == 0) {
+        if (arg_count == 4) {
+            fprintf(out, "    mc_cls();\n");
+            fprintf(out, "    mc_color(%s);\n", args[2]); 
+            fprintf(out, "    mc_box(20, 8, 42, 8);\n");
+            fprintf(out, "    mc_center(11, \"%s\");\n", args[0]);
+            fprintf(out, "    mc_color(37);\n");
+            fprintf(out, "    mc_center(13, \"%s\");\n", args[1]);
+            fprintf(out, "    fflush(stdout);\n");
+            fprintf(out, "    mc_sleep(%s);\n", args[3]); 
+            fprintf(out, "    mc_cls();\n");
+        }
+    }
+    else if (strcmp(cmd, "SET") == 0) {
+        if (arg_count == 2) fprintf(out, "    VAR_%s = %s;\n", args[0], args[1]);
+    } 
+
+    else if (strcmp(cmd, "IF") == 0) {
+        // 【修正1】引数が足りない場合は無視してクラッシュを防ぐ
+        if (arg_count < 3) return;
+
+        char *rhs = args[2];
+        char temp_rhs[10] = {0};
         
-        char *line_content = line;
-        while (isspace((unsigned char)*line_content)) line_content++;
-        if (strlen(line_content) == 0) continue;
+        // 【修正2】args[2]が存在することを保証してから中身を見る
+        if (rhs && isalpha(rhs[0]) && isupper(rhs[0])) {
+            sprintf(temp_rhs, "VAR_%s", args[2]);
+            rhs = temp_rhs;
+        }
 
-        int argc = 0;
-        char **argv = parse_args(line_content, &argc);
-        
-        if (argc == 0) continue;
-        char *cmd = argv[0];
-
-        if (cmd[strlen(cmd)-1] == ':') continue;
-
-        // --- コマンド処理 ---
-
-        if (strcmp(cmd, "PRINT") == 0) {
-            for (int i = 1; i < argc; i++) {
-                char *arg = argv[i];
-                int idx = get_var_index(arg);
-                
-                if (arg[0] == '"') {
-                    // 引用符付き文字列リテラル
-                    printf("%s", arg + 1); 
-                } else if (idx >= 0) {
-                    // 変数
-                    printf("%s", str_variables[idx]);
-                } else {
-                    // 引用符なし、変数名でもないトークンはそのまま出力（0/1/-1表示を防ぐ）
-                    printf("%s", arg);
-                }
-                printf(" "); 
-            }
-            printf("\n");
-
-        } else if (strcmp(cmd, "SET") == 0) {
-            if (argc < 3) error("SET: Not enough arguments");
-            char *var_name = argv[1];
-            char *val_str = argv[2];
-            int idx = get_var_index(var_name);
-            if (idx < 0) error("Invalid variable for SET");
-            
-            // すべて文字列として代入
-            if (val_str[0] == '"') {
-                 strncpy(str_variables[idx], val_str + 1, MAX_VAR_LEN - 1);
-            } else {
-                 strncpy(str_variables[idx], val_str, MAX_VAR_LEN - 1);
-            }
-            str_variables[idx][MAX_VAR_LEN - 1] = '\0';
-
-        } else if (strcmp(cmd, "CALC") == 0) {
-            if (argc < 4) error("CALC: Not enough arguments");
-            char *var_name = argv[1];
-            char *op = argv[2];
-            char *val_str = argv[3];
-            int idx = get_var_index(var_name);
-            if (idx < 0) error("Invalid variable for CALC");
-            
-            // 文字列を数値に変換して計算
-            long target_val = get_num_value(var_name);
-            long val = get_num_value(val_str);
-            
-            if (strcmp(op, "+") == 0) target_val += val;
-            else if (strcmp(op, "-") == 0) target_val -= val;
-            else if (strcmp(op, "*") == 0) target_val *= val;
-            else if (strcmp(op, "/") == 0) {
-                if (val == 0) error("Division by zero");
-                target_val /= val;
-            }
-            else if (strcmp(op, "%") == 0) target_val %= val;
-
-            // 結果を再び文字列として変数に保存
-            snprintf(str_variables[idx], MAX_VAR_LEN, "%ld", target_val);
-
-        } else if (strcmp(cmd, "INPUT") == 0) {
-            if (argc < 2) error("INPUT: Variable missing");
-            char *var_name = argv[1];
-            char *prompt = (argc >= 3 && argv[2][0] == '"') ? argv[2] : NULL;
-            int idx = get_var_index(var_name);
-            if (idx < 0) error("Invalid variable for INPUT");
-            
-            if (prompt) {
-                 printf("%s", prompt + 1);
-            } else {
-                printf("? ");
-            }
-
-            // 文字列として入力を受け付ける (fgetsを使用)
-            if (fgets(str_variables[idx], MAX_VAR_LEN, stdin) == NULL) {
-                error("Input error");
-            }
-            str_variables[idx][strcspn(str_variables[idx], "\n")] = '\0';
-            
-        // IF文 (数値のみ対応)
-        } else if (strcmp(cmd, "IF") == 0) {
-            if (argc < 6) error("IF: Not enough arguments");
-            // すべての引数を数値として評価
-            long lhs = get_num_value(argv[1]);
-            char *op = argv[2];
-            long rhs = get_num_value(argv[3]);
-            char *goto_kw = argv[4];
-            char *label = argv[5];
-            
-            int condition = 0;
-            if (strcmp(op, "==") == 0) condition = (lhs == rhs);
-            else if (strcmp(op, "!=") == 0) condition = (lhs != rhs);
-            else if (strcmp(op, ">") == 0) condition = (lhs > rhs);
-            else if (strcmp(op, "<") == 0) condition = (lhs < rhs);
-            if (condition) {
-                if (label && strcmp(goto_kw, "GOTO") == 0) jump_to_label(fp, label);
-                else if (label && strcmp(goto_kw, "CALL") == 0) {
-                     if (stack_ptr >= MAX_STACK) error("Stack overflow");
-                     call_stack[stack_ptr++] = ftell(fp);
-                     jump_to_label(fp, label);
-                }
-            }
-
-        } else if (strcmp(cmd, "GOTO") == 0) {
-            if (argc < 2) error("GOTO: Label missing");
-            jump_to_label(fp, argv[1]);
-
-        } else if (strcmp(cmd, "CALL") == 0) {
-            if (argc < 2) error("CALL: Label missing");
-            char *label = argv[1];
-            if (stack_ptr >= MAX_STACK) error("Stack overflow");
-            
-            call_stack[stack_ptr++] = ftell(fp);
-            jump_to_label(fp, label);
-
-        } else if (strcmp(cmd, "RET") == 0) {
-            if (stack_ptr <= 0) error("Stack underflow (Return without Call)");
-            
-            long ret_pos = call_stack[--stack_ptr];
-            fseek(fp, ret_pos, SEEK_SET);
-
-        } else if (strcmp(cmd, "WAIT") == 0) {
-            if (argc < 2) error("WAIT: Value missing");
-            long sec = get_num_value(argv[1]);
-            fflush(stdout);
-            sleep(sec);
-
-        } else if (strcmp(cmd, "COLOR") == 0) {
-            if (argc < 2) error("COLOR: Value missing");
-            set_color(get_num_value(argv[1]));
-        } else if (strcmp(cmd, "CLEAR") == 0) {
-            clear_screen();
-        } else if (strcmp(cmd, "POS") == 0) {
-            if (argc < 3) error("POS: Coordinates missing");
-            long x = get_num_value(argv[1]);
-            long y = get_num_value(argv[2]);
-            set_cursor(x, y);
-        } else if (strcmp(cmd, "EXIT") == 0) {
-            break;
+        if (arg_count == 5 && strcmp(args[3], "GOTO") == 0) {
+            fprintf(out, "    if (VAR_%s %s %s) goto %s;\n", args[0], args[1], rhs, args[4]);
+        }
+        else if (arg_count == 7 && strcmp(args[3], "CURSOR") == 0 && strcmp(args[4], "ADJ") == 0) {
+            fprintf(out, "    if (VAR_%s %s %s) LIST_%s.cursor += %s;\n", 
+                args[0], args[1], rhs, args[5], args[6]);
         }
     }
 
-    fclose(fp);
-    reset_color();
+    else if (strcmp(cmd, "GOTO") == 0) { 
+        if (arg_count == 1) fprintf(out, "    goto %s;\n", args[0]);
+    } else if (strcmp(cmd, "POS") == 0) { 
+        if (arg_count == 2) fprintf(out, "    mc_pos(%s, %s);\n", args[0], args[1]);
+    } else if (strcmp(cmd, "COLOR") == 0) { 
+        if (arg_count == 1) fprintf(out, "    mc_color(%s);\n", args[0]);
+    } else if (strcmp(cmd, "BOX") == 0) { 
+        if (arg_count == 4) fprintf(out, "    mc_box(%s, %s, %s, %s);\n", args[0], args[1], args[2], args[3]);
+    } else if (strcmp(cmd, "CLEAR") == 0) { fprintf(out, "    mc_cls();\n");
+    } else if (strcmp(cmd, "EXIT") == 0) { fprintf(out, "    return 0;\n");
+    } 
+    else if (strcmp(cmd, "LIST") == 0) {
+        if (arg_count == 2 && strcmp(args[0], "LOAD") == 0) {
+            fprintf(out, "    mc_load_dir(&LIST_%s);\n", args[1]);
+        } 
+        else if (arg_count == 5 && strcmp(args[0], "RENDER") == 0) { 
+            fprintf(out, "    mc_render_list(&LIST_%s, %s, %s, %s);\n", args[1], args[2], args[3], args[4]);
+        }
+    } 
+    else if (strcmp(cmd, "CURSOR") == 0) {
+        if (arg_count == 3 && strcmp(args[0], "ADJ") == 0) {
+            fprintf(out, "    LIST_%s.cursor += %s;\n", args[1], args[2]);
+        } else if (arg_count == 2 && strcmp(args[0], "LIMIT") == 0) { 
+            fprintf(out, "    if (LIST_%s.cursor < 0) LIST_%s.cursor = 0;\n", args[1]); 
+            fprintf(out, "    if (LIST_%s.cursor >= LIST_%s.count) LIST_%s.cursor = LIST_%s.count - 1;\n", args[1], args[1]); 
+        }
+    } else if (strcmp(cmd, "KEYWAIT") == 0) { 
+        if (arg_count == 1) fprintf(out, "    VAR_%s = mc_get_key();\n", args[0]);
+    } else if (strcmp(cmd, "GET") == 0) {
+        if (arg_count == 3 && strcmp(args[0], "ITEM_ISDIR") == 0) {
+            fprintf(out, "    VAR_%s = LIST_%s.is_dir[LIST_%s.cursor];\n", args[2], args[1], args[1]);
+        }
+    }
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s <script_file>\n", argv[0]);
-        return 1;
+    if (argc < 2) { printf("Usage: %s <script.mc>\n", argv[0]); return 1; }
+    
+    FILE *in = fopen(argv[1], "r");
+    if (!in) { perror("File open error"); return 1; }
+    out = fopen("out.c", "w");
+    if (!out) { perror("Output error"); return 1; }
+
+    write_header(); 
+    char line[MAX_LINE_LEN];
+    int in_c_block = 0;
+    
+    while (fgets(line, sizeof(line), in)) {
+        if (strstr(line, "{{")) { in_c_block = 1; continue; }
+        if (strstr(line, "}}")) { in_c_block = 0; continue; }
+        if (in_c_block) fprintf(out, "%s", line);
+        else parse_line(line);
     }
-    run_script(argv[1]);
+    
+    write_footer();
+    fclose(in); fclose(out);
+    
+    printf("Compiling to binary...\n");
+    int ret = system("gcc out.c -o app");
+    if (ret == 0) {
+        printf("Done! Run ./app\n");
+    } else {
+        printf("Compilation failed. (gcc returned %d). The generated code is in out.c\n", ret);
+    }
     return 0;
 }
