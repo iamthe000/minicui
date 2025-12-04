@@ -1,0 +1,44 @@
+CLEAR
+COLOR 32
+
+GOTO MAIN
+
+# --- サブルーチン定義 ---
+GET_NAME:
+    # INPUTで文字列を受け取る
+    INPUT N "What is your name? " 
+    RET
+
+# --- メイン処理 ---
+MAIN:
+    COLOR 37
+    PRINT "--- CUI Tool Activated ---"
+    PRINT "This tool now supports strings and spaces in print!"
+
+    # 1. 文字列入力のテスト
+    CALL GET_NAME
+    # Nに格納された文字列を表示 (Hello, <ユーザー名> ! ...)
+    PRINT "Hello, " N "! Glad you're testing this."
+    
+    # 2. 数値入力と計算 (CALC/IFは文字列変数の内容を数値に変換して使用)
+    
+    # Iに数値表現の文字列をINPUT
+    INPUT I "Please input a starting number (0-100): "
+    
+    # Iの内容をCALCで使用 -> 文字列を数値に変換して計算し、結果をIに文字列として保存
+    CALC I + 10
+    
+    PRINT "Your starting number plus ten is:" I
+
+    # 3. IF文のテスト (Iの内容を数値として評価)
+    IF I > 50 GOTO LARGE_NUM
+    PRINT "Your final number is small."
+    GOTO END
+
+LARGE_NUM:
+    PRINT "WOW! Your final number is large!"
+
+END:
+    COLOR 36
+    PRINT "--- Processing Complete ---"
+    EXIT
