@@ -14,6 +14,7 @@
 #define MAX_ARGS 20
 #define MAX_SCRIPT_LINES 2048
 #define MAX_FUNCTIONS 50
+#define MAX_WHILE_NESTING_DEPTH 50
 
 // --- MiniCUI Data Structures ---
 typedef struct {
@@ -35,6 +36,9 @@ char* script_lines[MAX_SCRIPT_LINES];
 int line_count = 0;
 McFunction functions[MAX_FUNCTIONS];
 int function_count = 0;
+int while_label_stack[MAX_WHILE_NESTING_DEPTH];
+int while_stack_ptr = 0;
+int while_label_counter = 0;
 
 // ===================================================
 // Code Generation - Runtime
@@ -342,6 +346,30 @@ void parse_line(char *line) {
     // INPUT
     else if (strcmp(cmd, "INPUT") == 0 && arg_count == 3) { fprintf(out, "    mc_input(%s, %s, %s, VAR_S);\n", get_c_var_name(args[0]), get_c_var_name(args[1]), get_c_var_name(args[2])); }
     
+    // WHILE / ENDWHILE
+    else if (strcmp(cmd, "WHILE") == 0 && arg_count == 3) {
+        int label_id = ++while_label_counter;
+        while_label_stack[while_stack_ptr++] = label_id;
+        
+        fprintf(out, "WHILE_START_%d:\n", label_id);
+        const char* var = get_c_var_name(args[0]);
+        const char* op = args[1];
+        const char* val = get_c_var_name(args[2]);
+        const char* c_op = (strcmp(op, "=") == 0) ? "==" : op;
+        
+        if (strstr(var, "VAR_S") == var) {
+            fprintf(out, "    if (!(strcmp(%s, %s) %s 0)) goto WHILE_END_%d;\n", var, val, c_op, label_id);
+        } else {
+            fprintf(out, "    if (!(%s %s %s)) goto WHILE_END_%d;\n", var, c_op, val, label_id);
+        }
+    }
+    else if (strcmp(cmd, "ENDWHILE") == 0) {
+        if (while_stack_ptr > 0) {
+            int label_id = while_label_stack[--while_stack_ptr];
+            fprintf(out, "    goto WHILE_START_%d;\n", label_id);
+            fprintf(out, "WHILE_END_%d:\n", label_id);
+        }
+    }
     // IF GOTO
     else if (strcmp(cmd, "IF") == 0 && arg_count == 5 && strcmp(args[3], "GOTO") == 0) {
         const char* var = get_c_var_name(args[0]);
@@ -462,18 +490,30 @@ int main(int argc, char *argv[]) {
     
     // 1. Write main function body
     write_main_entry();
+    while_stack_ptr = 0;
     for (int i = 0; i < line_count; i++) {
         if (!is_in_any_function(i)) {
             parse_line(script_lines[i]);
         }
+    }
+    if (while_stack_ptr > 0) {
+        printf("Compiler Error: Unclosed WHILE statement in main code block.\n");
+        fclose(out);
+        return 1;
     }
     write_main_exit();
 
     // 2. Write user function bodies
     for (int i = 0; i < function_count; i++) {
         fprintf(out, "void func_%s() {\n", functions[i].name);
+        while_stack_ptr = 0;
         for (int j = functions[i].start_line + 1; j < functions[i].end_line; j++) {
             parse_line(script_lines[j]);
+        }
+        if (while_stack_ptr > 0) {
+            printf("Compiler Error: Unclosed WHILE statement in function '%s'.\n", functions[i].name);
+            fclose(out);
+            return 1;
         }
         fprintf(out, "}\n\n");
     }
